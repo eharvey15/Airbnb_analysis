@@ -1,0 +1,506 @@
+---
+title: "Boston Airbnb Listing Price Predictive modeling"
+author: "Edward Harvey & Jake Naughton"
+date: "12/15/2021"
+output:
+  slidy_presentation: default
+  ioslides_presentation: default
+  beamer_presentation: default
+---
+
+## Objectives
+
+Our goal for this project is to use publicly available data on Boston-area Airbnb listings to help a first-time Airbnb renter accurately price their new listing. Our project consists of two analyses:
+
+-Using bootstrap CIs to suggest a listing price based on neighborhood and other characteristics
+
+-Using "sentiment analysis" of listing descriptions to identify vocabulary that influence price
+
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'center')
+```
+
+
+```{r, echo=FALSE}
+#cleaning and setting up data
+library(tidyverse)
+library(dplyr)
+library(scales)
+library(stringr)
+
+## import CSV file
+data <- read.csv(file="https://raw.githubusercontent.com/eharvey15/Airbnb_analysis/main/listings.csv",header = TRUE,sep = ",")
+
+#remove the dollar sign from the price variable,change to numeric data type, remove NAs
+data$price <- str_remove(data$price,"\\$")
+data$price <- as.numeric(data$price)
+
+#save to database
+db <- as.data.frame(data)
+
+#drop NAs for price and bedroom
+NArows_price <- which(is.na(db$price))
+NArows_bedrooms <- which(is.na(db$bedrooms))
+zero_bedrooms <- which(db$bedrooms==0)
+db <- db[-c(NArows_price,NArows_bedrooms, zero_bedrooms),]
+
+db$host_is_superhost <- ifelse(db$host_is_superhost=="t",TRUE, FALSE)
+
+```
+
+## Attempting to fit a Gamma distribution via MLE
+
+Airbnb prices in Boston appear to be Gamma distributed.
+
+```{r, echo=FALSE}
+#create likelihood function
+gamma_log_lik <- function(data, shape, scale=1/rate, rate=1/scale,...){
+  return(sum(log(dgamma(data, shape=shape, scale=scale))))
+}
+
+#tweak it so that we can use optim
+gamma_log_lik_2 <- function(data_input, x,...){
+  -1*gamma_log_lik(data = data_input, shape = x[1], scale=x[2])
+}
+
+#use optim to find the parameters
+price_gamma_fit<- optim(par=c(2,2), fn=(gamma_log_lik_2), data_input=db$price)
+
+#estimate mean and sd from this
+gamma_mean_estimate <- price_gamma_fit$par[1]*price_gamma_fit$par[2]
+gamma_sd_estimate <- sqrt(price_gamma_fit$par[1]*price_gamma_fit$par[2]^2)
+
+#create gamma density curve to overlay
+x_seq <- seq(from=min(db$price), to=max(db$price), length.out =1000)
+y_vals <- dgamma(x=x_seq, shape=price_gamma_fit$par[1], scale=price_gamma_fit$par[2])
+
+#plot data
+ggplot(db, mapping=aes(x=price))+
+  geom_histogram(aes(y=..density..), fill="blue")+
+  stat_function(fun=dgamma, 
+                args = list(shape=price_gamma_fit$par[1], scale=price_gamma_fit$par[2]),
+                geom = "point",
+                color="red",
+                n=5000,
+                size=0.1)+
+  scale_x_continuous(labels = label_dollar())+
+  geom_text(aes(x=500, y=0.004, label=paste("shape= ",price_gamma_fit$par[[1]])))+
+  geom_text(aes(x=500, y=0.0035, label=paste("scale= ",price_gamma_fit$par[[2]])))+
+  geom_text(aes(x=500, y=0.003, label=paste("mean = shape * scale = ",gamma_mean_estimate)))+
+  theme_bw()
+  
+```
+
+## Zooming in on neighborhoods
+
+Unfortunately individual neighborhoods do not show a common distribution.
+
+```{r}
+ggplot(data=db, aes(x=price, colour=neighbourhood_cleansed))+
+  geom_histogram(aes(y=..density..))+
+  facet_wrap(~neighbourhood_cleansed)+
+  scale_x_continuous(labels = label_dollar())+
+  guides(colour=FALSE)
+```
+
+
+## Boostrap CIs by neighbourhood
+
+Bootstrapping provides a non-parametric alternative for analyzing the distribution of neighborhood prices.
+
+```{r}
+N <- 1000
+neighbourhood <- unique(db$neighbourhood_cleansed)
+
+sample_means <- as.data.frame(matrix(NA, ncol=0, nrow=0))
+neighbourhood_boot_CI <- as.data.frame(matrix(NA, ncol=4,nrow=0))
+names(neighbourhood_boot_CI) <- c("neighbourhood","mean","lower_bound","upper_bound")
+
+for (j in neighbourhood) {
+  for (n in 1:N) {
+  workingdata <- db$price[db$neighbourhood_cleansed==j]
+  sample <- sample(x=workingdata, size=length(workingdata), replace = TRUE)
+  sample_means[n,j] <-mean(sample)
+  }
+  neighbourhood_boot_CI[j,"neighbourhood"] <- j
+  neighbourhood_boot_CI[j,"mean"] <- mean(sample_means[,j])
+  neighbourhood_boot_CI[j,"lower_bound"] <- quantile(sample_means[,j], 0.025)
+  neighbourhood_boot_CI[j,"upper_bound"] <- quantile(sample_means[,j], 0.975)
+}
+
+neighbourhood_boot_CI <- neighbourhood_boot_CI %>% arrange(desc(mean))
+neighbourhood_boot_CI[,"mean_rank"] <- seq(length(neighbourhood))
+
+ggplot(data=neighbourhood_boot_CI)+
+  geom_point(aes(x=mean,y=mean_rank, colour=neighbourhood))+
+  geom_segment(aes(x=lower_bound, xend=upper_bound,
+                   y=mean_rank, yend=mean_rank, 
+                   colour=neighbourhood))+
+  geom_text(aes(x=upper_bound+30, y=mean_rank, colour=neighbourhood,label=neighbourhood), size=2)+
+  xlab("Estimated Mean Price (USD)")+
+  scale_x_continuous(labels = label_dollar())+
+  theme_bw()+
+  theme(axis.title.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.position = "none",
+        )
+
+```
+
+## Bootstrap CIs for number of bedrooms
+
+The bootstrap method works for other property characteristics as well, such as the number of bedrooms.
+
+```{r}
+N <- 1000
+bedrooms <- as.integer(sort.int(unique(db$bedrooms)))
+
+sample_means <- as.data.frame(matrix(NA, ncol=0, nrow=0))
+bedrooms_boot_CI <- as.data.frame(matrix(NA, ncol=4,nrow=0))
+names(bedrooms_boot_CI) <- c("bedrooms","mean","lower_bound","upper_bound")
+
+
+for (j in bedrooms) {
+  for (n in 1:N) {
+  workingdata <- db$price[db$bedrooms==j]
+  sample <- sample(x=workingdata, size=length(workingdata), replace = TRUE)
+  sample_means[n,j] <-mean(sample)
+  }
+  bedrooms_boot_CI[j,"bedrooms"] <- j
+  bedrooms_boot_CI[j,"mean"] <- mean(sample_means[,j])
+  bedrooms_boot_CI[j,"lower_bound"] <- quantile(sample_means[,j], 0.025)
+  bedrooms_boot_CI[j,"upper_bound"] <- quantile(sample_means[,j], 0.975)
+}
+
+bedrooms_boot_CI <- bedrooms_boot_CI %>% arrange(desc(mean))
+bedrooms_boot_CI[,"mean_rank"] <- seq(length(bedrooms))
+
+#make a plot
+
+ggplot(data=bedrooms_boot_CI)+
+  geom_point(aes(x=mean,y=bedrooms, colour=bedrooms))+
+  geom_segment(aes(x=lower_bound, xend=upper_bound,
+                   y=bedrooms, yend=bedrooms, 
+                   colour=bedrooms))+
+  geom_text(aes(x=upper_bound+30, y=bedrooms, colour=bedrooms,label=bedrooms), show_guide=FALSE,
+            size=5)+
+  geom_text(aes(x=mean, y=bedrooms+0.5, label=dollar(mean)))+
+  xlab("Estimated Mean Price (USD)")+
+  scale_x_continuous(labels = label_dollar())+
+  theme_bw()+
+  theme(legend.position="none")
+```
+
+## Bootstrap CI predictive function for various characteristics
+
+We developed a function to provide bootstrap CIs according to the following characteristics, any combination of which may be specified:
+
+-Neighborhood
+
+-Number of bathrooms, bedrooms and beds
+
+-Property type and room type
+
+-whether the host is a "superhost"
+
+```{r}
+price_listing_func <- function(neighbourhood=NULL, 
+                               num_bedroom=NULL,
+                               num_beds=NULL,
+                               type_property=NULL,
+                               type_room=NULL,
+                               superhost=NULL,
+                               N=1000, 
+                               alpha=0.05, ...){
+  
+  #first, let's gather only the data we want
+  workingdata <- db %>% select(price, 
+                               neighbourhood_cleansed, 
+                               bedrooms,
+                               beds,
+                               property_type,
+                               room_type,
+                               host_is_superhost)
+  
+  #then we will filter it based on which criteria are selected
+  if(!is.null(neighbourhood)){
+  workingdata <- workingdata %>% filter(neighbourhood_cleansed %in% neighbourhood)}
+  
+  if(!is.null(num_bedroom)){
+  workingdata <- workingdata %>% filter(bedrooms %in% num_bedroom)}
+  
+  if(!is.null(num_beds)){
+  workingdata <- workingdata %>% filter(beds %in% num_beds)}
+  
+  if(!is.null(type_property)){
+  workingdata <- workingdata %>% filter(property_type %in% type_property)}
+  
+  if(!is.null(type_room)){
+  workingdata <- workingdata %>% filter(room_type %in% type_room)}
+  
+  if(!is.null(superhost)){
+  workingdata <- workingdata %>% filter(host_is_superhost %in% superhost)}
+  
+  
+  #take just the prices
+  filtered_prices <- workingdata$price
+  observations <- length(filtered_prices)
+  
+  #show error message if there are no properties with these characteristics
+  if(observations==0){
+    stop("No existing listings with those characteristics")
+  }
+
+  
+  #create vector to store sample means
+  sample_means <- rep(NA,N)
+  
+  for (i in 1:N) {
+    sample <- sample(x=filtered_prices, size=observations, replace=TRUE)
+    sample_means[i] <- mean(sample)
+  }
+  mean_estimate <- mean(sample_means)
+  upper_bound <- quantile(x=sample_means,probs=1-alpha/2)
+  lower_bound <- quantile(x=sample_means, probs=alpha/2)
+  
+  #show warning if there are fewer than 5
+  
+  if(observations < 5){
+    warning("Fewer than 5 properties with these characteristics")}
+    
+  return(list(lower_bound = lower_bound, mean_estimate = mean_estimate, upper_bound=upper_bound,
+              number_of_observations=observations))
+
+}
+
+
+```
+
+```{r, echo=TRUE}
+(price_listing_func(neighbourhood="Back Bay", num_beds = 2, type_room = "Entire home/apt"))
+```
+
+## Inputs can be vectors, will return warning if dataset is limited
+
+```{r, echo=TRUE, error=TRUE, warning=TRUE}
+(price_listing_func(neighbourhood="Roslindale", num_bedroom = 2, superhost = TRUE))
+```
+
+
+## Sentiment Analysis
+
+```{r, echo = FALSE}
+summary_data <- data$summary
+allWords <- strsplit(summary_data, split = "\\s+")
+all_words_vector <- unlist(allWords)
+ind_words <- unique(all_words_vector)
+all_words_string <- paste(all_words_vector, collapse = " ")
+word_count <- as.data.frame(table(all_words_vector))
+all_words_vector <- tolower(all_words_vector)
+removed_words <- c("a", "in", "to", "into", "and", "of", "is", "with", "for", 
+                   "from", "this", "near", "by", 1:1000, "on", "my", "you", 
+                   "your", "&", "has", "are", "it", "or", "at", "as", "the", 
+                   ".", ",", "?", "!")
+new_all_words_vector <- all_words_vector[!all_words_vector %in% removed_words]
+new_word_count <- as.data.frame(table(new_all_words_vector))
+words_test <- gsub("[[:punct:]]", "", new_all_words_vector)
+test_word_count <- as.data.frame(table(words_test))
+Sentiment_search <- c("private", "downtown", "great", "minutes", "walking", 
+                      "heart", "spacious", "beautiful", "good", "historic", 
+                      "restaurants", "quiet", "station", "parking", "subway")
+Sentiment_words_df <- filter(test_word_count, words_test %in% Sentiment_search)
+Sentiment_words_df <- Sentiment_words_df %>% arrange(desc(Freq))
+print(Sentiment_df <- data.frame (Sentiment_words_df$words_test, Sentiment_words_df$Freq))
+```
+
+We are selecting 15 words to use for a sentiment analysis to see if the summary
+of the property can have any impact on its price. To choose the descriptors for
+analysis we looked at the most frequently reoccurring words excluding ones like
+prepositions, numbers, Boston, etc.
+
+## Distribution of price by appearance of Sentiment
+```{r, echo = FALSE}
+data <- mutate(data,
+               private = regexpr("private", data$summary, ignore.case = TRUE),
+               downtown = regexpr("downtown", data$summary, ignore.case = TRUE),
+               great = regexpr("great", data$summary, ignore.case = TRUE),
+               minutes = regexpr("minutes", data$summary, ignore.case = TRUE),
+               walking = regexpr("walking", data$summary, ignore.case = TRUE),
+               heart = regexpr("heart", data$summary, ignore.case = TRUE),
+               spacious = regexpr("spacious", data$summary, ignore.case = TRUE),
+               beautiful = regexpr("beautiful", data$summary, ignore.case = TRUE),
+               good = regexpr("good", data$summary, ignore.case = TRUE),
+               historic = regexpr("historic", data$summary, ignore.case = TRUE),
+               restaurants = regexpr("restaurants", data$summary, ignore.case = TRUE),
+               quiet = regexpr("quiet", data$summary, ignore.case = TRUE),
+               station = regexpr("station", data$summary, ignore.case = TRUE),
+               parking = regexpr("parking", data$summary, ignore.case = TRUE),
+               subway = regexpr("subway", data$summary, ignore.case = TRUE)
+)
+
+private_sentiment_data <- filter(data, private >= 0)
+downtown_sentiment_data <- filter(data, downtown >= 0)
+great_sentiment_data <- filter(data, great >= 0)
+minutes_sentiment_data <- filter(data, minutes >= 0)
+walking_sentiment_data <- filter(data, walking >= 0)
+heart_sentiment_data <- filter(data, heart >= 0)
+spacious_sentiment_data <- filter(data, spacious >= 0)
+beautiful_sentiment_data <- filter(data, beautiful >= 0)
+good_sentiment_data <- filter(data, good >= 0)
+historic_sentiment_data <- filter(data, historic >= 0)
+restaurants_sentiment_data <- filter(data, restaurants >= 0)
+quiet_sentiment_data <- filter(data, quiet >= 0)
+station_sentiment_data <- filter(data, station >= 0)
+parking_sentiment_data <- filter(data, parking >= 0)
+subway_sentiment_data <- filter(data, subway >= 0)
+
+station_sentiment_data <- select(station_sentiment_data,
+                                 price,
+                                 summary)
+station_sentiment_data["Sentiment"] <- "station"
+
+downtown_sentiment_data <- select(downtown_sentiment_data,
+                                 price,
+                                 summary)
+downtown_sentiment_data["Sentiment"] <- "downtown"
+
+beautiful_sentiment_data <- select(beautiful_sentiment_data,
+                                 price,
+                                 summary)
+beautiful_sentiment_data["Sentiment"] <- "beautiful"
+
+good_sentiment_data <- select(good_sentiment_data,
+                                 price,
+                                 summary)
+good_sentiment_data["Sentiment"] <- "good"
+
+great_sentiment_data <- select(great_sentiment_data,
+                                 price,
+                                 summary)
+great_sentiment_data["Sentiment"] <- "great"
+
+heart_sentiment_data <- select(heart_sentiment_data,
+                                 price,
+                                 summary)
+heart_sentiment_data["Sentiment"] <- "heart"
+
+historic_sentiment_data <- select(historic_sentiment_data,
+                                 price,
+                                 summary)
+historic_sentiment_data["Sentiment"] <- "historic"
+
+minutes_sentiment_data <- select(minutes_sentiment_data,
+                                 price,
+                                 summary)
+minutes_sentiment_data["Sentiment"] <- "minutes"
+
+parking_sentiment_data <- select(parking_sentiment_data,
+                                 price,
+                                 summary)
+parking_sentiment_data["Sentiment"] <- "parking"
+
+private_sentiment_data <- select(private_sentiment_data,
+                                 price,
+                                 summary)
+private_sentiment_data["Sentiment"] <- "private"
+
+quiet_sentiment_data <- select(quiet_sentiment_data,
+                                 price,
+                                 summary)
+quiet_sentiment_data["Sentiment"] <- "quiet"
+
+restaurants_sentiment_data <- select(restaurants_sentiment_data,
+                                 price,
+                                 summary)
+restaurants_sentiment_data["Sentiment"] <- "restaurants"
+
+spacious_sentiment_data <- select(spacious_sentiment_data,
+                                 price,
+                                 summary)
+spacious_sentiment_data["Sentiment"] <- "spacious"
+
+subway_sentiment_data <- select(subway_sentiment_data,
+                                 price,
+                                 summary)
+subway_sentiment_data["Sentiment"] <- "subway"
+
+walking_sentiment_data <- select(walking_sentiment_data,
+                                 price,
+                                 summary)
+walking_sentiment_data["Sentiment"] <- "walking"
+
+Sentiment_df <- rbind(beautiful_sentiment_data, downtown_sentiment_data,
+                      good_sentiment_data, great_sentiment_data, heart_sentiment_data,
+                      historic_sentiment_data, minutes_sentiment_data, parking_sentiment_data,
+                      private_sentiment_data, quiet_sentiment_data, restaurants_sentiment_data,
+                      spacious_sentiment_data, station_sentiment_data, subway_sentiment_data,
+                      walking_sentiment_data)
+
+ggplot(data=Sentiment_df, aes(x=price, colour=Sentiment_df$Sentiment))+
+  geom_histogram(aes(y=..density..))+
+  facet_wrap(~Sentiment_df$Sentiment)+
+  scale_x_continuous(labels = label_dollar())+
+  guides(colour="none")
+
+```
+
+## Bootstrap Intervals for Sentiment
+
+```{r}
+sample_means <- as.data.frame(matrix(NA, ncol=0, nrow=0))
+Sentiment_boot_CI <- as.data.frame(matrix(NA, ncol=4,nrow=0))
+names(Sentiment_boot_CI) <- c("Sentiment","mean","lower_bound","upper_bound")
+
+for (j in Sentiment_words_df$words_test) {
+  for (n in 1:N) {
+  workingdata <- Sentiment_df$price[Sentiment_df$Sentiment==j]
+  sample <- sample(x=workingdata, size=length(workingdata), replace = TRUE)
+  sample_means[n,j] <-mean(sample, na.rm = TRUE)
+  }
+  Sentiment_boot_CI[j,"Sentiment"] <- j
+  Sentiment_boot_CI[j,"mean"] <- mean(sample_means[,j])
+  Sentiment_boot_CI[j,"lower_bound"] <- quantile(sample_means[,j], 0.025)
+  Sentiment_boot_CI[j,"upper_bound"] <- quantile(sample_means[,j], 0.975)
+}
+
+Sentiment_boot_CI <- Sentiment_boot_CI %>% arrange(desc(mean))
+Sentiment_boot_CI[,"mean_rank"] <- seq(1:15)
+
+ggplot(data=Sentiment_boot_CI)+
+  geom_point(aes(x=mean,y=mean_rank, colour=Sentiment))+
+  geom_segment(aes(x=lower_bound, xend=upper_bound,
+                   y=mean_rank, yend=mean_rank, 
+                   colour=Sentiment))+
+  geom_text(aes(x=upper_bound+30, y=mean_rank, colour=Sentiment,label=Sentiment), size=4)+
+  xlab("Estimated Mean Price (USD)")+
+  scale_x_continuous(labels = label_dollar())+
+  theme_bw()+
+  theme(axis.title.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.position = "none",
+        )
+```
+
+
+
+## Conclusions
+
+-It is not appropriate to assume a gamma distribution for price data when broken down by listing characteristic
+
+-Bootstrap CIs provide a reliable way to predict price data for a limited number of combined characteristics
+
+-Only about four sentiment words appear to be associated with significantly higher prices
+
+-These four words may be associated with neighborhood characteristics (e.g. "historic")
+
+-The analysis does not take into account combinations of words (e.g. "historic," "parking," and "private"), so there is some overlap in the bootstrap CIs, and certain combinations of words might produce different effects.
+
+
+
